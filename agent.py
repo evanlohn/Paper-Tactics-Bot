@@ -43,7 +43,7 @@ class HeuristicAgent(Agent):
             if smvs not in seen_moves:
                 deduped.append((tl, gs, mvseq))
             seen_moves.add(smvs)
-        return done
+        return deduped
 
     def choose_move_seq(self, game: Game):
         gs = GameState(game.preferences['size'], game.me['units'], game.me['walls'], game.opponent['units'], game.opponent['walls'], game.trenches)
