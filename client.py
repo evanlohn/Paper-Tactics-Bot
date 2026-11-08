@@ -1,4 +1,6 @@
 import json
+import os
+import sys
 import time
 import platform
 import argparse
@@ -14,6 +16,36 @@ from game import Game
 
         
 
+class Recorder:
+    """Appends every server message (and our moves) to one JSONL file per game."""
+
+    def __init__(self, record_dir):
+        self.dir = record_dir
+        self.f = None
+        if record_dir:
+            os.makedirs(record_dir, exist_ok=True)
+
+    def start(self, tag=""):
+        if self.dir:
+            import uuid
+            name = time.strftime("%Y%m%d-%H%M%S") + (f"-{tag}" if tag else "") + f"-{uuid.uuid4().hex[:6]}.jsonl"
+            self.f = open(os.path.join(self.dir, name), "a")
+            print("recording to", self.f.name)
+
+    def write(self, **rec):
+        if self.f:
+            self.f.write(json.dumps({"t": time.time(), **rec}) + "\n")
+            self.f.flush()
+
+    def close(self):
+        if self.f:
+            self.f.close()
+            self.f = None
+
+
+recorder = Recorder(None)
+
+
 # see https://stackoverflow.com/questions/1111056/get-time-zone-information-of-the-system-in-python
 def get_tz():
     return time.tzname[time.daylight]
@@ -21,7 +53,9 @@ def get_tz():
 def wait_for_message(ws: ClientConnection, game=None, timeout=None):
     try:
         message = ws.recv(timeout=timeout)
-        return json.loads(message)
+        msg = json.loads(message)
+        recorder.write(msg=msg)
+        return msg
     except TimeoutError:
         concede(ws, game)
         return None
@@ -50,7 +84,8 @@ def create_game(ws: ClientConnection, icon, preferences):
         'preferences': preferences,
     })
 
-def make_move(ws: ClientConnection, game, move):
+def make_move(ws: ClientConnection, game, move, value=None):
+    recorder.write(bot_move=move, value=value)
     send_json(ws, {
         'action': "make-turn",
         'gameId': game.id,
@@ -69,14 +104,27 @@ def main() -> None:
     parser.add_argument('--code', type=str, default="", help='game code, used to only match against players with the same code')
     parser.add_argument('--icon', type=int, default=0, help='which icon to use (default to X)')
 
-    parser.add_argument('--agent', type=str, default='random', help='The type of Agent you would like to run. See client.py for options.')
+    parser.add_argument('--agent', type=str, default='random', help='The type of Agent you would like to run: random, heuristic, az')
+    parser.add_argument('--ckpt', type=str, default='', help='[az] checkpoint .pkl (reloaded between games if it changes)')
+    parser.add_argument('--sims', type=int, default=256, help='[az] search simulations per move')
+    parser.add_argument('--pt-path', type=str, default=os.path.expanduser('~/main-fs/paper-tactics-jax'), help='[az] path to paper-tactics-jax')
+    parser.add_argument('--record-dir', type=str, default='', help='append every game (server messages + our moves) as JSONL here')
+    parser.add_argument('--games', type=int, default=1, help='number of games to play in a row (0 = forever)')
+    parser.add_argument('--timeout', type=float, default=600, help='seconds to wait for an opponent move before conceding (detects disconnects)')
 
     args = parser.parse_args()
+    global recorder
+    recorder = Recorder(args.record_dir)
 
     if args.agent == 'random':
         agent = RandomAgent()
     elif args.agent == 'heuristic':
         agent = HeuristicAgent()
+    elif args.agent == 'az':
+        sys.path.insert(0, args.pt_path)
+        from pt.agent import AZAgent
+        agent = AZAgent(args.ckpt, num_simulations=args.sims)
+        print(f'loaded {args.ckpt} (iter {agent.ckpt_iter}), {args.sims} sims/move')
     else:
         raise NotImplementedError('unsupported agent type')
 
@@ -90,8 +138,23 @@ def main() -> None:
         'code': args.code,
     }
 
-    timeout= 600
+    timeout = args.timeout
 
+    played = 0
+    while args.games == 0 or played < args.games:
+        if args.agent == 'az' and agent.maybe_reload():
+            print(f'reloaded checkpoint (iter {agent.ckpt_iter})')
+        recorder.start()
+        recorder.write(preferences=preferences, agent=args.agent, ckpt=args.ckpt,
+                       ckpt_iter=getattr(agent, 'ckpt_iter', None))
+        try:
+            play_one_game(args, agent, preferences, timeout)
+        finally:
+            recorder.close()
+        played += 1
+
+
+def play_one_game(args, agent, preferences, timeout):
     try:
         with connect("wss://az7ndrlaxk.execute-api.eu-central-1.amazonaws.com/rolling") as ws:
             create_game(ws, str(args.icon), preferences)
@@ -115,8 +178,9 @@ def main() -> None:
                     if not success or game.me['is_defeated'] or game.opponent['is_defeated'] or game.opponent['is_gone']:
                         break
                     move = agent.choose_move(game)
-                    print(move)
-                    make_move(ws, game, move)
+                    value = getattr(agent, 'last_value', None)
+                    print(move, '' if value is None else f'(value {value:+.2f})')
+                    make_move(ws, game, move, value)
 
                     success = wait_for_update(ws, game, timeout=timeout)
                 if not success or game.me['is_defeated'] or game.opponent['is_defeated'] or game.opponent['is_gone']:
