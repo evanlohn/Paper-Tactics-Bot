@@ -3,11 +3,14 @@
   <code>     bot moves first. One bot connection always waits in the matchmaking queue;
              when someone joins, that game moves to its own thread and a new waiting
              connection opens immediately.
-  <code>-p2  you move first. The server makes whoever was queued first the first player,
-             so the bot polls: it connects, asks for a game, and leaves after
-             --p2-wait seconds if nobody was waiting. If you join during that window,
-             the bot would end up moving first, so it concedes right away (just
-             rejoin).
+  <code>-p2  you move first. The server gives the first move to whoever was queued
+             first, and the bot is always queued, so your first join makes the bot
+             move first: it concedes at once and sits out for --p2-rejoin-delay (6 s).
+             Rejoin within that window and you're the waiting one, so the bot joins
+             second and you move first.
+
+  Both kinds keep a single waiting request, renewed every --refresh (180 s) seconds
+  because the server deletes queued requests after an hour. No polling while idle.
 
   python host.py --code evan-az-1eef [friend-code ...] --ckpt .../latest.pkl --record-dir .../human_games [--p2]
 
@@ -125,14 +128,20 @@ def start_game(ws, msg, args, agent, label, snap):
     t.start()
 
 
-def host_bot_first(args, prefs, agent):
-    """Always keep one connection waiting under `code`.
+def hold_queue(args, prefs, agent, human_first):
+    """Keep one request waiting under prefs["code"] and play whoever matches it.
 
-    The server deletes queued requests after an hour even if the connection is still
-    open, and someone who joins while we're not (visibly) queued just gets queued
-    themselves; two queued requests never match. So the waiting request is renewed every
-    `--refresh` seconds. The old connection is closed first, so the new request can't
-    match our own old one, and the new request pops anyone left waiting."""
+    The server deletes queued requests after an hour even if the connection stays open,
+    and two queued requests never match each other. So the request is renewed every
+    `--refresh` seconds: the old connection is closed first (so the new request can't
+    match our own old one), and the new request also picks up anyone left waiting.
+
+    human_first (the <code>-p2 codes): the server gives the first move to whoever was
+    queued first. If someone matches our waiting request, we'd move first, so we concede
+    at once and stay out of the queue for --p2-rejoin-delay seconds. When they rejoin
+    inside that window, *their* request is the waiting one, and our next request matches
+    it with them moving first. No polling while nobody is playing."""
+    code = prefs["code"]
     announced = False
     while True:
         ws = None
@@ -140,59 +149,37 @@ def host_bot_first(args, prefs, agent):
             ws = connect(URL)
             create_game(ws, args.icon, prefs)
             if not announced:
-                log(f"[{prefs['code']}] waiting for an opponent under code '{prefs['code']}' "
-                    f"(re-queueing every {args.refresh:.0f}s)")
+                log(f"[{code}] waiting for an opponent under code '{code}' "
+                    f"({'you move first' if human_first else 'bot moves first'}; re-queueing every {args.refresh:.0f}s)")
                 announced = True
             msg = json.loads(ws.recv(timeout=args.refresh))
         except TimeoutError:
             if ws is None:  # connect() itself timed out
-                log(f"[{prefs['code']}] connect timed out; retrying")
+                log(f"[{code}] connect timed out; retrying")
                 time.sleep(3)
             else:
                 ws.close()  # renew: drop this request and queue a fresh one
             continue
         except (ConnectionClosed, OSError) as e:
-            log(f"[{prefs['code']}] waiting connection dropped ({type(e).__name__}); reconnecting")
+            log(f"[{code}] waiting connection dropped ({type(e).__name__}); reconnecting")
             if ws is not None:
                 ws.close()
             time.sleep(3)
             continue
         if "me" not in msg:
-            log(f"[{prefs['code']}] unexpected message: {str(msg)[:200]}")
+            log(f"[{code}] unexpected message: {str(msg)[:200]}")
             ws.close()
             continue
-        # If someone was already queued, we joined second: still a fine game, just play it.
-        start_game(ws, msg, args, agent, prefs["code"], agent.current())
-        announced = False
-
-
-def host_bot_second(args, prefs, agent):
-    """Poll under `code-p2` so the human is always the queued (first) player."""
-    while True:
-        ws = None
-        try:
-            ws = connect(URL)
-            create_game(ws, args.icon, prefs)
-            try:
-                msg = json.loads(ws.recv(timeout=args.p2_wait))
-            except TimeoutError:
-                ws.close()
-                time.sleep(args.p2_interval)
-                continue
-        except (ConnectionClosed, OSError) as e:
-            log(f"[{prefs['code']}] poll failed ({type(e).__name__}); retrying")
-            time.sleep(5)
-            continue
-        if "me" not in msg:
-            ws.close()
-            continue
-        if msg["my_turn"]:
-            # we were the queued one -> we'd move first; bail so the human can rejoin
+        if human_first and msg["my_turn"]:
             send(ws, {"action": "concede", "gameId": msg["id"]})
             ws.close()
-            log(f"[{prefs['code']}] joined as first player (game {msg['id'][:8]}), conceded; rejoin to play as first")
+            log(f"[{code}] matched as first player (game {msg['id'][:8]}): conceded; "
+                f"rejoin within {args.p2_rejoin_delay:.0f}s to move first")
+            time.sleep(args.p2_rejoin_delay)
             continue
-        start_game(ws, msg, args, agent, prefs["code"], agent.current())
+        # bot-first code where someone was already queued: we're second; still a fine game
+        start_game(ws, msg, args, agent, code, agent.current())
+        announced = False
 
 
 def main():
@@ -212,10 +199,10 @@ def main():
     ap.add_argument("--icon", type=int, default=0)
     ap.add_argument("--url", default=DEFAULT_URL, help="server websocket URL (e.g. ws://localhost:8001 for a local test server)")
     ap.add_argument("--no-first", action="store_true", help="don't host the bot-first code")
-    ap.add_argument("--p2", action="store_true", help="also poll <code>-p2 (you move first)")
-    ap.add_argument("--p2-wait", type=float, default=1.0,
-                    help="seconds to stay queued per poll (if you join inside this window the bot concedes and you rejoin)")
-    ap.add_argument("--p2-interval", type=float, default=8.0, help="seconds between polls (max wait to get matched)")
+    ap.add_argument("--p2", action="store_true", help="also host <code>-p2 (you move first)")
+    ap.add_argument("--p2-rejoin-delay", type=float, default=6.0,
+                    help="after conceding as first player on a -p2 code, stay out of the queue this long "
+                         "so the human's rejoin becomes the waiting request")
     args = ap.parse_args()
     global URL
     URL = args.url
@@ -231,9 +218,9 @@ def main():
     threads = []
     for code in args.code:
         if not args.no_first:
-            threads.append(threading.Thread(target=host_bot_first, args=(args, {**base, "code": code}, agent), daemon=True))
+            threads.append(threading.Thread(target=hold_queue, args=(args, {**base, "code": code}, agent, False), daemon=True))
         if args.p2:
-            threads.append(threading.Thread(target=host_bot_second, args=(args, {**base, "code": code + "-p2"}, agent), daemon=True))
+            threads.append(threading.Thread(target=hold_queue, args=(args, {**base, "code": code + "-p2"}, agent, True), daemon=True))
     for t in threads:
         t.start()
     for t in threads:
