@@ -126,15 +126,35 @@ def start_game(ws, msg, args, agent, label, snap):
 
 
 def host_bot_first(args, prefs, agent):
-    """Always keep one connection waiting under `code`."""
+    """Always keep one connection waiting under `code`.
+
+    The server deletes queued requests after an hour even if the connection is still
+    open, and someone who joins while we're not (visibly) queued just gets queued
+    themselves; two queued requests never match. So the waiting request is renewed every
+    `--refresh` seconds. The old connection is closed first, so the new request can't
+    match our own old one, and the new request pops anyone left waiting."""
+    announced = False
     while True:
+        ws = None
         try:
             ws = connect(URL)
             create_game(ws, args.icon, prefs)
-            log(f"[{prefs['code']}] waiting for an opponent under code '{prefs['code']}'")
-            msg = json.loads(ws.recv())  # blocks until matched
+            if not announced:
+                log(f"[{prefs['code']}] waiting for an opponent under code '{prefs['code']}' "
+                    f"(re-queueing every {args.refresh:.0f}s)")
+                announced = True
+            msg = json.loads(ws.recv(timeout=args.refresh))
+        except TimeoutError:
+            if ws is None:  # connect() itself timed out
+                log(f"[{prefs['code']}] connect timed out; retrying")
+                time.sleep(3)
+            else:
+                ws.close()  # renew: drop this request and queue a fresh one
+            continue
         except (ConnectionClosed, OSError) as e:
             log(f"[{prefs['code']}] waiting connection dropped ({type(e).__name__}); reconnecting")
+            if ws is not None:
+                ws.close()
             time.sleep(3)
             continue
         if "me" not in msg:
@@ -143,6 +163,7 @@ def host_bot_first(args, prefs, agent):
             continue
         # If someone was already queued, we joined second: still a fine game, just play it.
         start_game(ws, msg, args, agent, prefs["code"], agent.current())
+        announced = False
 
 
 def host_bot_second(args, prefs, agent):
@@ -185,6 +206,8 @@ def main():
     ap.add_argument("--sims", type=int, default=256)
     ap.add_argument("--pt-path", default=os.path.expanduser("~/main-fs/paper-tactics-jax"))
     ap.add_argument("--record-dir", default="")
+    ap.add_argument("--refresh", type=float, default=180,
+                    help="re-queue the bot-first waiting request this often (server deletes queued requests after 1h)")
     ap.add_argument("--timeout", type=float, default=180, help="seconds without an opponent move before conceding")
     ap.add_argument("--icon", type=int, default=0)
     ap.add_argument("--url", default=DEFAULT_URL, help="server websocket URL (e.g. ws://localhost:8001 for a local test server)")
